@@ -93,7 +93,7 @@ Resources:
       Type: A
       ResourceRecords:
         - !Ref NextCloudAddr
-      TTL: "300"
+      TTL: "60"
   NextCloudAddr:
     Type: AWS::EC2::EIP
     Properties:
