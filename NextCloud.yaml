@@ -166,7 +166,7 @@ Resources:
                   -c legacy_auth=false
                   -c key=${NextCloudUserAccessKey}
                   -c secret=${key_secret}
-                  external_S3 amazons3 amazons3::accesskey
+                  / amazons3 amazons3::accesskey
                 - key_secret: !GetAtt NextCloudUserAccessKey.SecretAccessKey
   NextCloudWaitCondition:
     Type: AWS::CloudFormation::WaitCondition
