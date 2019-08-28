@@ -156,18 +156,16 @@ Resources:
             00_enable_files_external:
               command: "/snap/bin/nextcloud.occ app:enable files_external"
             01_create_s3_storage:
-              command: !Sub 
-                - >
-                  /snap/bin/nextcloud.occ files_external:create
-                  -c bucket=${NextCloudBucket}
-                  -c region=${AWS::Region}
-                  -c use_ssl=true
-                  -c use_path_style=true
-                  -c legacy_auth=false
-                  -c key=${NextCloudUserAccessKey}
-                  -c secret=${key_secret}
-                  / amazons3 amazons3::accesskey
-                - key_secret: !GetAtt NextCloudUserAccessKey.SecretAccessKey
+              command: !Sub >
+                /snap/bin/nextcloud.occ files_external:create
+                -c bucket=${NextCloudBucket}
+                -c region=${AWS::Region}
+                -c use_ssl=true
+                -c use_path_style=true
+                -c legacy_auth=false
+                -c key=${NextCloudUserAccessKey}
+                -c secret=${NextCloudUserAccessKey.SecretAccessKey}
+                / amazons3 amazons3::accesskey
   NextCloudWaitCondition:
     Type: AWS::CloudFormation::WaitCondition
     Properties:
@@ -196,9 +194,7 @@ Resources:
               - s3:*
             Resource:
               - !GetAtt NextCloudBucket.Arn
-              - !Sub
-                - "${arn}/*"
-                - arn: !GetAtt NextCloudBucket.Arn
+              - !Sub "${NextCloudBucket.Arn}/*"
   NextCloudUser:
     Type: AWS::IAM::User
     Properties:
