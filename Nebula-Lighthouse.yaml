@@ -1,0 +1,355 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Creates an EC2 instance to function as a Nebula Lighthouse
+
+Parameters:
+  InstanceType:
+    Description: EC2 Instance Type
+    Type: String
+    Default: t3.micro
+  ImageId:
+    Description: EC2 Image Id
+    Type: AWS::EC2::Image::Id
+    Default: ami-064a0193585662d74
+  NebulaDnsName:
+    Description: The FQDN of the Nebula instance
+    Type: String
+  Route53HostedZone:
+    Description: The Route 53 hosted zone for the FQDN
+    Type: String
+  AllowedIcmpCidrBlock:
+    Description: The CIDR block from which to allow ICMP
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  AllowedNebulaCidrBlock:
+    Description: The CIDR block from which to allow Nebula traffic
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+  NebulaLighthouseIp:
+    Description: The IP to use for the Nebula lighthouse
+    Type: String
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$'
+  NebulaNetworkCidrSize:
+    Description: The size of the Nebula network
+    Type: Number
+    Default: 24
+  NebulaNetworkCaName:
+    Description: The name to use for the Nebula CA cert
+    Type: String
+
+Resources:
+  NebulaSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Nebula SecurityGroup
+      GroupName: NebulaSG
+      SecurityGroupIngress:
+        - CidrIp: !Ref AllowedIcmpCidrBlock
+          Description: Allow all ICMP
+          FromPort: -1
+          ToPort: -1
+          IpProtocol: icmp
+        - CidrIp: !Ref AllowedNebulaCidrBlock
+          Description: Allow all HTTP
+          FromPort: 4242
+          ToPort: 4242
+          IpProtocol: udp
+  NebulaDnsEntry:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Ref Route53HostedZone
+      Name: !Ref NebulaDnsName
+      Type: A
+      ResourceRecords:
+        - !Ref NebulaAddr
+      TTL: "60"
+  NebulaAddr:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref NebulaServer
+  NebulaServer:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      IamInstanceProfile: !Ref NebulaInstanceProfile
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      SecurityGroups:
+        - !Ref NebulaSg
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get full-upgrade -y
+          apt-get install -y wget python-pip
+          wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+          pip install aws-cfn-bootstrap-latest.tar.gz
+
+          cfn-init -s ${AWS::StackName} -r NebulaServer -c nebula --region ${AWS::Region}
+          cfn-signal -e "$?" --stack ${AWS::StackName} --resource NebulaServer --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          nebula:
+            - install_configure_nebula
+        install_configure_nebula:
+          sources:
+            /tmp/nebula: "https://github.com/slackhq/nebula/releases/download/v1.0.0/nebula-linux-amd64.tar.gz"
+          files:
+            /etc/systemd/system/nebula.service:
+              content: |
+                [Unit]
+                Description=nebula
+                Wants=basic.target
+                After=basic.target network.target
+
+                [Service]
+                SyslogIdentifier=nebula
+                StandardOutput=syslog
+                StandardError=syslog
+                ExecReload=/bin/kill -HUP $MAINPID
+                ExecStart=/usr/local/bin/nebula -config /etc/nebula/config.yml
+                Restart=always
+
+                [Install]
+                WantedBy=multi-user.target
+              owner: root
+              group: root
+              mode: "000644"
+            /etc/nebula/config.yml:
+              content: |
+                # This is the nebula example configuration file. You must edit, at a minimum, the static_host_map, lighthouse, and firewall sections
+                # PKI defines the location of credentials for this node. Each of these can also be inlined by using the yaml ": |" syntax.
+                pki:
+                  ca: /etc/nebula/ca.crt
+                  cert: /etc/nebula/lighthouse1.crt
+                  key: /etc/nebula/lighthouse1.key
+                  #blacklist is a list of certificate fingerprints that we will refuse to talk to
+                  #blacklist:
+                  #  - c99d4e650533b92061b09918e838a5a0a6aaee21eed1d12fd937682865936c72
+
+                # The static host map defines a set of hosts with with fixed IP addresses on the internet (or any network).
+                # A host can have multiple fixed IP addresses defined here, and nebula will try each when establishing a tunnel.
+                # The syntax is:
+                #   "{nebula ip}": ["{routable ip/dns name}:{routable port}"]
+                # Example, if your lighthouse has the nebula IP of 192.168.100.1 and has the real ip address of 100.64.22.11 and runs on port 4242:
+                static_host_map:
+                  "{{lighthouse}}": ["{{url}}:4242"]
+
+
+                lighthouse:
+                  # am_lighthouse is used to enable lighthouse functionality for a node. This should ONLY be true on nodes
+                  # you have configured to be lighthouses in your network
+                  am_lighthouse: true
+                  # serve_dns optionally starts a dns listener that responds to various queries and can even be
+                  # delegated to for resolution
+                  #serve_dns: false
+                  # interval is the number of seconds between updates from this node to a lighthouse.
+                  # during updates, a node sends information about its current IP addresses to each node.
+                  interval: 60
+                  # hosts is a list of lighthouse hosts this node should report to and query from
+                  # IMPORTANT: THIS SHOULD BE EMPTY ON LIGHTHOUSE NODES
+                  hosts: []
+            
+                # Port Nebula will be listening on. The default here is 4242. For a lighthouse node, the port should be defined,
+                # however using port 0 will dynamically assign a port and is recommended for roaming nodes.
+                listen:
+                  host: 0.0.0.0
+                  port: 4242
+                  # Sets the max number of packets to pull from the kernel for each syscall (under systems that support recvmmsg)
+                  # default is 64, does not support reload
+                  #batch: 64
+                  # Configure socket buffers for the udp side (outside), leave unset to use the system defaults. Values will be doubled by the kernel
+                  # Default is net.core.rmem_default and net.core.wmem_default (/proc/sys/net/core/rmem_default and /proc/sys/net/core/rmem_default)
+                  # Maximum is limited by memory in the system, SO_RCVBUFFORCE and SO_SNDBUFFORCE is used to avoid having to raise the system wide
+                  # max, net.core.rmem_max and net.core.wmem_max
+                  #read_buffer: 10485760
+                  #write_buffer: 10485760
+
+
+                # Local range is used to define a hint about the local network range, which speeds up discovering the fastest
+                # path to a network adjacent nebula node.
+                #local_range: "172.16.0.0/24"
+
+                # Handshake mac is an optional network-wide handshake authentication step that is used to prevent nebula from
+                # responding to handshakes from nodes not in possession of the shared secret. This is primarily used to prevent
+                # detection of nebula nodes when someone is scanning a network.
+                #handshake_mac:
+                  #key: "DONOTUSETHISKEY"
+                  # You can define multiple accepted keys
+                  #accepted_keys:
+                    #- "DONOTUSETHISKEY"
+                    #- "dontusethiseither"
+
+                # sshd can expose informational and administrative functions via ssh this is a
+                #sshd:
+                  # Toggles the feature
+                  #enabled: true
+                  # Host and port to listen on, port 22 is not allowed for your safety
+                  #listen: 127.0.0.1:2222
+                  # A file containing the ssh host private key to use
+                  # A decent way to generate one: ssh-keygen -t ed25519 -f ssh_host_ed25519_key -N "" < /dev/null
+                  #host_key: ./ssh_host_ed25519_key
+                  # A file containing a list of authorized public keys
+                  #authorized_users:
+                    #- user: steeeeve
+                      # keys can be an array of strings or single string
+                      #keys:
+                        #- "ssh public key string"
+
+                # Configure the private interface. Note: addr is baked into the nebula certificate
+                tun:
+                  # Name of the device
+                  dev: nebula1
+                  # Toggles forwarding of local broadcast packets, the address of which depends on the ip/mask encoded in pki.cert
+                  drop_local_broadcast: false
+                  # Toggles forwarding of multicast packets
+                  drop_multicast: false
+                  # Sets the transmit queue length, if you notice lots of transmit drops on the tun it may help to raise this number. Default is 500
+                  tx_queue: 500
+                  # Default MTU for every packet, safe setting is (and the default) 1300 for internet based traffic
+                  mtu: 1300
+                  # Route based MTU overrides, you have known vpn ip paths that can support larger MTUs you can increase/decrease them here
+                  routes:
+                    #- mtu: 8800
+                    #  route: 10.0.0.0/16
+
+                # TODO
+                # Configure logging level
+                logging:
+                  # panic, fatal, error, warning, info, or debug. Default is info
+                  level: info
+                  # json or text formats currently available. Default is text
+                  format: text
+
+                #stats:
+                  #type: graphite
+                  #prefix: nebula
+                  #protocol: tcp
+                  #host: 127.0.0.1:9999
+                  #interval: 10s
+
+                  #type: prometheus
+                  #listen: 127.0.0.1:8080
+                  #path: /metrics
+                  #namespace: prometheusns
+                  #subsystem: nebula
+                  #interval: 10s
+
+                # Nebula security group configuration
+                firewall:
+                  conntrack:
+                    tcp_timeout: 120h
+                    udp_timeout: 3m
+                    default_timeout: 10m
+                    max_connections: 100000
+
+                  # The firewall is default deny. There is no way to write a deny rule.
+                  # Rules are comprised of a protocol, port, and one or more of host, group, or CIDR
+                  # Logical evaluation is roughly: port AND proto AND ca_sha AND ca_name AND (host OR group OR groups OR cidr)
+                  # - port: Takes `0` or `any` as any, a single number `80`, a range `200-901`, or `fragment` to match second and further fragments of fragmented packets (since there is no port available).
+                  #   code: same as port but makes more sense when talking about ICMP, TODO: this is not currently implemented in a way that works, use `any`
+                  #   proto: `any`, `tcp`, `udp`, or `icmp`
+                  #   host: `any` or a literal hostname, ie `test-host`
+                  #   group: `any` or a literal group name, ie `default-group`
+                  #   groups: Same as group but accepts a list of values. Multiple values are AND'd together and a certificate would have to contain all groups to pass
+                  #   cidr: a CIDR, `0.0.0.0/0` is any.
+                  #   ca_name: An issuing CA name
+                  #   ca_sha: An issuing CA shasum
+
+                  outbound:
+                    # Allow all outbound traffic from this node
+                    - port: any
+                      proto: any
+                      host: any
+
+                  inbound:
+                    # Allow icmp between any nebula hosts
+                    - port: any
+                      proto: any
+                      host: any
+              context:
+                lighthouse: !Ref NebulaLighthouseIp
+                url: !Ref NebulaDnsName
+          commands:
+            01_copy_nebula_bins:
+              command: "cp /tmp/nebula/* /usr/local/bin"
+            02_generate_ca_cert:
+              cwd: /etc/nebula
+              command: !Sub "/usr/local/bin/nebula-cert ca -name '${NebulaNetworkCaName}'"
+            03_generate_lighthouse_host_cert:
+              cwd: /etc/nebula
+              command: !Sub "/usr/local/bin/nebula-cert sign -name lighthouse1 -ip '${NebulaLighthouseIp}/${NebulaNetworkCidrSize}'"
+            04_enable_nebula_service:
+              command: systemctl enable nebula.service
+            05_start_nebula_service:
+              command: systemctl start nebula.service
+  NebulaIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Allow SSM Access
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SystemsManagerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: "*"
+                Action:
+                  - cloudwatch:PutMetricData
+                  - ec2:DescribeTags
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - ssm:DescribeAssociation
+                  - ssm:GetDeployablePatchSnapshotForInstance
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:GetManifest
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:ListAssociations
+                  - ssm:ListInstanceAssociations
+                  - ssm:PutInventory
+                  - ssm:PutComplianceItems
+                  - ssm:PutConfigurePackageResult
+                  - ssm:UpdateAssociationStatus
+                  - ssm:UpdateInstanceAssociationStatus
+                  - ssm:UpdateInstanceInformation
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                  - ec2messages:AcknowledgeMessage
+                  - ec2messages:DeleteMessage
+                  - ec2messages:FailMessage
+                  - ec2messages:GetEndpoint
+                  - ec2messages:GetMessages
+                  - ec2messages:SendReply
+  NebulaInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref NebulaIamRole
